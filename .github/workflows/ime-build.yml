@@ -1,0 +1,13 @@
+name: Build RustDesk IME APK
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    uses: ./.github/workflows/flutter-build.yml
+    secrets: inherit
+    with:
+      upload-artifact: true
+      upload-tag: ime-apk
+      publish-update-metadata: false
