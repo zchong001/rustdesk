@@ -910,7 +910,7 @@ class MainActivity : FlutterActivity() {
             codecObject.put("hw", hw)
             var mime_type = ""
             codec.supportedTypes.forEach { type ->
-                if (listOf("video/avc", "video/hevc").contains(type)) { // "video/x-vnd.on2.vp8", "video/x-vnd.on2.vp9", "video/av01"
+            if (type == "video/avc") { // [H264 patch] vivo Y50 等机型的 HEVC 硬件编码器配置失败会导致画面冻结，只上报 H.264
                     mime_type = type;
                 }
             }
