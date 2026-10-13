@@ -430,6 +430,11 @@ class InputService : AccessibilityService() {
             }
         }
 
+                // [RustDesk IME patch] 优先通过自带的 RustDesk 输入法提交远程文本。
+        if (textToCommit != null && RustDeskIme.commitRemoteText(textToCommit)) {
+            return
+        }
+
         if (Build.VERSION.SDK_INT >= 33) {
             getInputMethod()?.let { inputMethod ->
                 inputMethod.getCurrentInputConnection()?.let { inputConnection ->
