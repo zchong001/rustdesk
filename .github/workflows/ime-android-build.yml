@@ -1,11 +1,14 @@
-# 路线3（v2）：官方 1.5.0 + RustDesk 输入法补丁（含“回车提交”）
+# 路线3（v3）：官方 1.5.0 + RustDesk 输入法补丁（含回车提交）+ 无帧看门狗
 #
-# v2 新增：
-#   1) 内嵌 IME 源码（不再从本仓库 master 下载，workflow 自包含）
-#   2) 按键（回车/退格等）也优先走 IME 的输入连接 —— 密码框只接受 IME，不接受无障碍按键注入
-#   3) 回车会先尝试 performEditorAction(Done)，失败再发 KEYCODE_ENTER
+# v3 新增【无帧看门狗】：屏幕处于安全窗口（钉钉登录/密码页）或采集卡住导致长时间无帧时，
+#   自动重新绑定虚拟显示表面（复用已有 MediaProjection，不弹权限框）→ 画面自动恢复，
+#   无需再手动"回主页/断开重连"。
+#   实现位置：MainService.kt（默认走 ImageReader 原始帧路径，每帧都会触发监听回调，
+#   正好是观测"是否还有帧"的最佳位置；恢复复用现成的 createOrSetVirtualDisplay / resize+setSurface）。
+#
+# v2：内嵌 IME 源码；按键（回车/退格）也走 IME 输入连接；回车 = performEditorAction(Done)
 # 为什么基于 1.5.0：master 的安卓视频编码在这台 vivo Y50 上 configure 失败（OMX -38，画面全黑）
-name: Build IME APK (1.5.0 + enter)
+name: Build IME APK (1.5.0 + enter + watchdog)
 
 on:
   workflow_dispatch:
@@ -62,7 +65,7 @@ jobs:
         uses: actions/cache@6f8efc29b200d32929f49075959781ed54ec270c # v3
         with:
           path: /tmp/flutter_rust_bridge
-          key: bridge-150b-${{ env.BRIDGE_FLUTTER_VERSION }}
+          key: bridge-150c-${{ env.BRIDGE_FLUTTER_VERSION }}
 
       - name: Install flutter
         uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
@@ -159,7 +162,7 @@ jobs:
           ref: ${{ env.UPSTREAM_REF }}
           submodules: recursive
 
-      - name: Apply IME patch
+      - name: Apply patches (IME + enter + watchdog)
         shell: bash
         run: |
           set -euo pipefail
@@ -284,7 +287,7 @@ jobs:
           </input-method>
           XML_EOF
 
-          echo "==> 就地修改 AndroidManifest / strings.xml / InputService.kt"
+          echo "==> 就地修改 AndroidManifest / strings.xml / InputService.kt / MainService.kt"
           python3 - <<'PY'
           import io, sys
 
@@ -292,10 +295,13 @@ jobs:
               t = io.open(path, encoding="utf-8").read()
               if old not in t:
                   print("ANCHOR NOT FOUND:", path)
+                  print("---- anchor ----")
+                  print(old)
                   sys.exit(1)
               io.open(path, "w", encoding="utf-8").write(t.replace(old, new, 1))
               print("patched", path)
 
+          # 1) AndroidManifest.xml：注册 IME 服务
           mf = "flutter/android/app/src/main/AndroidManifest.xml"
           old_mf = '''            <meta-data
                           android:name="android.accessibilityservice"
@@ -318,10 +324,12 @@ jobs:
                   </service>'''
           edit(mf, old_mf, new_mf)
 
+          # 2) strings.xml：输入法子类型名称
           st = "flutter/android/app/src/main/res/values/strings.xml"
           edit(st, "</resources>",
                '    <string name="rustdesk_ime_subtype">RustDesk 远程输入</string>\n</resources>')
 
+          # 3) InputService.kt：文本与按键优先走 IME（回车提交）
           ins = "flutter/android/app/src/main/kotlin/com/carriez/flutter_hbb/InputService.kt"
           old_ins = '''            } else if (tryHandlePowerKeyEvent(event)) {
                           return
@@ -339,8 +347,7 @@ jobs:
                       return
                   }
 
-                  // [RustDesk IME patch 2] 按键（回车/退格等）也优先走 IME 的输入连接：
-                  // 密码框会拒绝无障碍按键注入，但接受 IME。失败则回落到原有逻辑。
+                  // [RustDesk IME patch 2] 按键（回车/退格等）也优先走 IME 的输入连接
                   if (RustDeskIme.isActive && ke != null) {
                       if (ke.keyCode == KeyEventAndroid.KEYCODE_ENTER) {
                           if (RustDeskIme.submitEnter()) {
@@ -354,7 +361,97 @@ jobs:
                   if (Build.VERSION.SDK_INT >= 33) {'''
           edit(ins, old_ins, new_ins)
 
-          print("IME patch applied OK")
+          # 4) MainService.kt：无帧看门狗（安全窗口/采集卡住时自动重建采集表面）
+          ms = "flutter/android/app/src/main/kotlin/com/carriez/flutter_hbb/MainService.kt"
+          wd_fields = '''    private var virtualDisplay: VirtualDisplay? = null
+
+              // ===== [无帧看门狗 patch] =====
+              // 安全窗口（钉钉登录/密码页）或采集卡住时 MediaProjection 停止出帧；
+              // 检测到长时间无帧则重新绑定虚拟显示表面（复用现有 MediaProjection，不弹权限框）。
+              private var wdLastFrameAt = 0L
+              private var wdLastRecoveryAt = 0L
+              private var wdRunning = false
+              private val wdHandler = android.os.Handler(android.os.Looper.getMainLooper())
+              private val WD_INTERVAL = 5000L
+              private val WD_NO_FRAME = 10000L
+              private val WD_COOLDOWN = 30000L
+
+              private val wdTask = object : Runnable {
+                  override fun run() {
+                      try {
+                          if (wdRunning && isStart && wdLastFrameAt > 0) {
+                              val now = System.currentTimeMillis()
+                              val pm = getSystemService("power") as? android.os.PowerManager
+                              val interactive = pm?.isInteractive ?: true
+                              if (interactive && now - wdLastFrameAt > WD_NO_FRAME &&
+                                  now - wdLastRecoveryAt > WD_COOLDOWN) {
+                                  wdLastRecoveryAt = now
+                                  Log.w(logTag, "[watchdog] no frame for " + (now - wdLastFrameAt) +
+                                          "ms, re-attach capture surface")
+                                  reattachCaptureSurface()
+                              }
+                          }
+                      } catch (e: Exception) {
+                          Log.e(logTag, "[watchdog] error: " + e)
+                      }
+                      if (wdRunning) wdHandler.postDelayed(this, WD_INTERVAL)
+                  }
+              }
+
+              private fun startWatchdog() {
+                  if (wdRunning) return
+                  wdRunning = true
+                  wdLastFrameAt = System.currentTimeMillis()
+                  wdLastRecoveryAt = 0L
+                  wdHandler.postDelayed(wdTask, WD_INTERVAL)
+                  Log.d(logTag, "[watchdog] started")
+              }
+
+              private fun stopWatchdog() {
+                  wdRunning = false
+                  wdHandler.removeCallbacks(wdTask)
+                  Log.d(logTag, "[watchdog] stopped")
+              }
+
+              private fun reattachCaptureSurface() {
+                  val s = surface ?: return
+                  val vd = virtualDisplay
+                  try {
+                      if (vd != null) {
+                          vd.setSurface(null)
+                          wdHandler.postDelayed({
+                              try {
+                                  vd.resize(SCREEN_INFO.width, SCREEN_INFO.height, SCREEN_INFO.dpi)
+                                  vd.setSurface(s)
+                                  Log.w(logTag, "[watchdog] surface re-attached")
+                              } catch (e: Exception) {
+                                  Log.e(logTag, "[watchdog] re-attach failed: " + e)
+                              }
+                          }, 400)
+                      } else {
+                          val mp = mediaProjection
+                          if (mp != null) createOrSetVirtualDisplay(mp, s)
+                      }
+                  } catch (e: Exception) {
+                      Log.e(logTag, "[watchdog] restart failed: " + e)
+                  }
+              }
+              // ===== [/无帧看门狗 patch] ====='''
+          edit(ms, "    private var virtualDisplay: VirtualDisplay? = null", wd_fields)
+
+          # 每帧刷新时间戳（ImageReader 每帧都会回调）
+          edit(ms, "if (image == null || !isStart) return@setOnImageAvailableListener",
+                  "if (image == null || !isStart) return@setOnImageAvailableListener\n                                wdLastFrameAt = System.currentTimeMillis()")
+
+          # 采集启动时开启看门狗
+          edit(ms, '        _isStart = true\n        FFI.setFrameRawEnable("video",true)',
+                  '        _isStart = true\n        startWatchdog()\n        FFI.setFrameRawEnable("video",true)')
+
+          # 采集停止时关闭看门狗
+          edit(ms, '    fun stopCapture() {\n        Log.d(logTag, "Stop Capture")',
+                  '    fun stopCapture() {\n        Log.d(logTag, "Stop Capture")\n        stopWatchdog()')
+
+          print("ALL patches applied OK")
           PY
 
           echo "==> 校验补丁结果"
@@ -362,6 +459,9 @@ jobs:
           grep -c "rustdesk_ime_subtype" flutter/android/app/src/main/res/values/strings.xml
           grep -c "submitEnter" flutter/android/app/src/main/kotlin/com/carriez/flutter_hbb/InputService.kt
           grep -c "submitEnter" flutter/android/app/src/main/kotlin/com/carriez/flutter_hbb/RustDeskIme.kt
+          grep -c "watchdog" flutter/android/app/src/main/kotlin/com/carriez/flutter_hbb/MainService.kt
+          grep -n "startWatchdog()" flutter/android/app/src/main/kotlin/com/carriez/flutter_hbb/MainService.kt
+          grep -n "wdLastFrameAt = System.currentTimeMillis()" flutter/android/app/src/main/kotlin/com/carriez/flutter_hbb/MainService.kt
 
       - name: Install flutter
         uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
@@ -420,7 +520,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          prefix-key: rustdesk-lib-cache-150b
+          prefix-key: rustdesk-lib-cache-150c
           key: aarch64-linux-android
 
       - name: Build rustdesk lib
@@ -448,10 +548,10 @@ jobs:
           flutter build apk --release --target-platform android-arm64 --split-per-abi
           popd
           mkdir -p out
-          mv ./flutter/build/app/outputs/flutter-apk/app-arm64-v8a-release.apk out/rustdesk-${{ env.VERSION }}-arm64-ime-enter.apk
+          mv ./flutter/build/app/outputs/flutter-apk/app-arm64-v8a-release.apk out/rustdesk-${{ env.VERSION }}-arm64-ime-watchdog.apk
 
       - name: Upload APK
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: rustdesk-ime-150-enter-arm64-apk
-          path: out/rustdesk-${{ env.VERSION }}-arm64-ime-enter.apk
+          name: rustdesk-ime-watchdog-arm64-apk
+          path: out/rustdesk-${{ env.VERSION }}-arm64-ime-watchdog.apk
