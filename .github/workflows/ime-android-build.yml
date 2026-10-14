@@ -1,11 +1,17 @@
-# 自包含的 RustDesk 定制 APK 构建（Android arm64，带 IME 补丁）
-# 不调用任何 ./.github/workflows/* 复用流程，绕开 fork 里 reusable workflow 的 startup_failure
-name: Build IME APK (self-contained)
+# 路线3（v2）：官方 1.5.0 + RustDesk 输入法补丁（含“回车提交”）
+#
+# v2 新增：
+#   1) 内嵌 IME 源码（不再从本仓库 master 下载，workflow 自包含）
+#   2) 按键（回车/退格等）也优先走 IME 的输入连接 —— 密码框只接受 IME，不接受无障碍按键注入
+#   3) 回车会先尝试 performEditorAction(Done)，失败再发 KEYCODE_ENTER
+# 为什么基于 1.5.0：master 的安卓视频编码在这台 vivo Y50 上 configure 失败（OMX -38，画面全黑）
+name: Build IME APK (1.5.0 + enter)
 
 on:
   workflow_dispatch:
 
 env:
+  UPSTREAM_REF: "1.5.0"
   FLUTTER_VERSION: "3.24.5"
   BRIDGE_FLUTTER_VERSION: "3.22.3"
   RUST_VERSION: "1.75"
@@ -15,15 +21,17 @@ env:
   VCPKG_COMMIT_ID: "9e593bb18ea69cc5095e012465dcd675a822ed0d"
   VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
   NDK_VERSION: "r28c"
-  VERSION: "1.5.1"
+  VERSION: "1.5.0"
 
 jobs:
   generate-bridge:
     runs-on: ubuntu-22.04
     steps:
-      - name: Checkout source code
+      - name: Checkout upstream 1.5.0
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
+          repository: rustdesk/rustdesk
+          ref: ${{ env.UPSTREAM_REF }}
           submodules: recursive
 
       - name: Install prerequisites
@@ -54,7 +62,7 @@ jobs:
         uses: actions/cache@6f8efc29b200d32929f49075959781ed54ec270c # v3
         with:
           path: /tmp/flutter_rust_bridge
-          key: bridge-${{ env.BRIDGE_FLUTTER_VERSION }}
+          key: bridge-150b-${{ env.BRIDGE_FLUTTER_VERSION }}
 
       - name: Install flutter
         uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
@@ -144,10 +152,216 @@ jobs:
             tree \
             wget
 
-      - name: Checkout source code
+      - name: Checkout upstream 1.5.0
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
+          repository: rustdesk/rustdesk
+          ref: ${{ env.UPSTREAM_REF }}
           submodules: recursive
+
+      - name: Apply IME patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          KDIR="flutter/android/app/src/main/kotlin/com/carriez/flutter_hbb"
+          RES="flutter/android/app/src/main/res"
+          mkdir -p "$KDIR" "$RES/xml"
+
+          echo "==> 写入 RustDeskIme.kt"
+          cat > "$KDIR/RustDeskIme.kt" <<'KOTLIN_EOF'
+          package com.carriez.flutter_hbb
+
+          import android.inputmethodservice.InputMethodService
+          import android.util.Log
+          import android.view.KeyEvent
+          import android.view.View
+          import android.view.inputmethod.EditorInfo
+          import android.widget.TextView
+
+          /**
+           * RustDesk 远程输入法（自定义补丁）
+           * 远程文本/按键经本 IME 的 InputConnection 提交 —— 密码框只接受 IME，不接受无障碍注入。
+           */
+          class RustDeskIme : InputMethodService() {
+
+              companion object {
+                  private const val TAG = "RustDeskIme"
+
+                  @Volatile
+                  private var instance: RustDeskIme? = null
+
+                  val isActive: Boolean
+                      get() = instance != null
+
+                  fun commitRemoteText(text: String): Boolean {
+                      val ime = instance ?: return false
+                      val conn = ime.currentInputConnection ?: return false
+                      return try {
+                          val ok = conn.commitText(text, 1)
+                          conn.finishComposingText()
+                          Log.i(TAG, "commitText ok=" + ok)
+                          ok
+                      } catch (e: Exception) {
+                          Log.e(TAG, "commitText failed", e)
+                          false
+                      }
+                  }
+
+                  fun sendRemoteKeyEvent(event: KeyEvent): Boolean {
+                      val ime = instance ?: return false
+                      val conn = ime.currentInputConnection ?: return false
+                      return try {
+                          val sent = conn.sendKeyEvent(event)
+                          if (event.action == KeyEvent.ACTION_DOWN) {
+                              conn.sendKeyEvent(KeyEvent(KeyEvent.ACTION_UP, event.keyCode))
+                          }
+                          sent
+                      } catch (e: Exception) {
+                          Log.e(TAG, "sendRemoteKeyEvent failed", e)
+                          false
+                      }
+                  }
+
+                  /** 回车提交：先试 performEditorAction(Done)，不行再发 KEYCODE_ENTER */
+                  fun submitEnter(): Boolean {
+                      val ime = instance ?: return false
+                      val conn = ime.currentInputConnection ?: return false
+                      return try {
+                          val opts = ime.currentInputEditorInfo?.imeOptions ?: 0
+                          val action = opts and EditorInfo.IME_MASK_ACTION
+                          if (action != EditorInfo.IME_ACTION_NONE && action != EditorInfo.IME_ACTION_UNSPECIFIED) {
+                              val acted = conn.performEditorAction(action)
+                              Log.i(TAG, "performEditorAction action=" + action + " ok=" + acted)
+                              if (acted) return true
+                          }
+                          val ok = conn.sendKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_ENTER)) &&
+                                   conn.sendKeyEvent(KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_ENTER))
+                          Log.i(TAG, "sendKeyEvent ENTER ok=" + ok)
+                          ok
+                      } catch (e: Exception) {
+                          Log.e(TAG, "submitEnter failed", e)
+                          false
+                      }
+                  }
+              }
+
+              override fun onCreate() {
+                  super.onCreate()
+                  instance = this
+                  Log.i(TAG, "onCreate")
+              }
+
+              override fun onDestroy() {
+                  instance = null
+                  Log.i(TAG, "onDestroy")
+                  super.onDestroy()
+              }
+
+              override fun onStartInput(editorInfo: EditorInfo?, restarting: Boolean) {
+                  super.onStartInput(editorInfo, restarting)
+                  Log.d(TAG, "onStartInput pkg=" + editorInfo?.packageName)
+              }
+
+              override fun onCreateInputView(): View {
+                  val view = TextView(this)
+                  view.text = "RustDesk 远程输入法（请在控制端输入）"
+                  view.textSize = 13f
+                  view.setPadding(24, 18, 24, 18)
+                  return view
+              }
+          }
+          KOTLIN_EOF
+
+          echo "==> 写入 rustdesk_ime.xml"
+          cat > "$RES/xml/rustdesk_ime.xml" <<'XML_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <input-method xmlns:android="http://schemas.android.com/apk/res/android"
+              android:supportsSwitchingToNextInputMethod="true">
+              <subtype
+                  android:label="@string/rustdesk_ime_subtype"
+                  android:imeSubtypeLocale="en_US"
+                  android:imeSubtypeMode="keyboard" />
+          </input-method>
+          XML_EOF
+
+          echo "==> 就地修改 AndroidManifest / strings.xml / InputService.kt"
+          python3 - <<'PY'
+          import io, sys
+
+          def edit(path, old, new):
+              t = io.open(path, encoding="utf-8").read()
+              if old not in t:
+                  print("ANCHOR NOT FOUND:", path)
+                  sys.exit(1)
+              io.open(path, "w", encoding="utf-8").write(t.replace(old, new, 1))
+              print("patched", path)
+
+          mf = "flutter/android/app/src/main/AndroidManifest.xml"
+          old_mf = '''            <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_service_config" />
+                  </service>'''
+          new_mf = old_mf + '''
+
+                  <!-- RustDesk 远程输入法（自定义补丁） -->
+                  <service
+                      android:name=".RustDeskIme"
+                      android:exported="true"
+                      android:label="RustDesk"
+                      android:permission="android.permission.BIND_INPUT_METHOD">
+                      <intent-filter>
+                          <action android:name="android.view.InputMethod" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.view.im"
+                          android:resource="@xml/rustdesk_ime" />
+                  </service>'''
+          edit(mf, old_mf, new_mf)
+
+          st = "flutter/android/app/src/main/res/values/strings.xml"
+          edit(st, "</resources>",
+               '    <string name="rustdesk_ime_subtype">RustDesk 远程输入</string>\n</resources>')
+
+          ins = "flutter/android/app/src/main/kotlin/com/carriez/flutter_hbb/InputService.kt"
+          old_ins = '''            } else if (tryHandlePowerKeyEvent(event)) {
+                          return
+                      }
+                  }
+
+                  if (Build.VERSION.SDK_INT >= 33) {'''
+          new_ins = '''            } else if (tryHandlePowerKeyEvent(event)) {
+                          return
+                      }
+                  }
+
+                  // [RustDesk IME patch 1] 文本优先走 IME.commitText（密码框也接受）
+                  if (textToCommit != null && RustDeskIme.commitRemoteText(textToCommit)) {
+                      return
+                  }
+
+                  // [RustDesk IME patch 2] 按键（回车/退格等）也优先走 IME 的输入连接：
+                  // 密码框会拒绝无障碍按键注入，但接受 IME。失败则回落到原有逻辑。
+                  if (RustDeskIme.isActive && ke != null) {
+                      if (ke.keyCode == KeyEventAndroid.KEYCODE_ENTER) {
+                          if (RustDeskIme.submitEnter()) {
+                              return
+                          }
+                      } else if (RustDeskIme.sendRemoteKeyEvent(ke)) {
+                          return
+                      }
+                  }
+
+                  if (Build.VERSION.SDK_INT >= 33) {'''
+          edit(ins, old_ins, new_ins)
+
+          print("IME patch applied OK")
+          PY
+
+          echo "==> 校验补丁结果"
+          grep -c "RustDeskIme" flutter/android/app/src/main/AndroidManifest.xml
+          grep -c "rustdesk_ime_subtype" flutter/android/app/src/main/res/values/strings.xml
+          grep -c "submitEnter" flutter/android/app/src/main/kotlin/com/carriez/flutter_hbb/InputService.kt
+          grep -c "submitEnter" flutter/android/app/src/main/kotlin/com/carriez/flutter_hbb/RustDeskIme.kt
 
       - name: Install flutter
         uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
@@ -206,7 +420,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          prefix-key: rustdesk-lib-cache-android
+          prefix-key: rustdesk-lib-cache-150b
           key: aarch64-linux-android
 
       - name: Build rustdesk lib
@@ -227,19 +441,17 @@ jobs:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
           export PATH=/usr/lib/jvm/java-17-openjdk-amd64/bin:$PATH
-          # Increase Gradle JVM memory for CI builds
           sed -i "s/org.gradle.jvmargs=-Xmx1024M/org.gradle.jvmargs=-Xmx2g/g" ./flutter/android/gradle.properties
-          # CI 没有官方签名密钥，用 debug 签名，保证 APK 可直接安装
           sed -i "s/signingConfigs.release/signingConfigs.debug/g" ./flutter/android/app/build.gradle
           cp ${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so ./flutter/android/app/src/main/jniLibs/arm64-v8a/
           pushd flutter
           flutter build apk --release --target-platform android-arm64 --split-per-abi
           popd
           mkdir -p out
-          mv ./flutter/build/app/outputs/flutter-apk/app-arm64-v8a-release.apk out/rustdesk-${{ env.VERSION }}-arm64-ime.apk
+          mv ./flutter/build/app/outputs/flutter-apk/app-arm64-v8a-release.apk out/rustdesk-${{ env.VERSION }}-arm64-ime-enter.apk
 
       - name: Upload APK
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: rustdesk-ime-arm64-apk
-          path: out/rustdesk-${{ env.VERSION }}-arm64-ime.apk
+          name: rustdesk-ime-150-enter-arm64-apk
+          path: out/rustdesk-${{ env.VERSION }}-arm64-ime-enter.apk
